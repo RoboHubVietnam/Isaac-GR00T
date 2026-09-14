@@ -2000,6 +2000,9 @@ class EquiMimicgenConfig(BaseDataConfig):
     num_hand = 1
     rot_type="axis_angle"
     rel_action=False
+    # Only the top/head camera (video.image) is rotated for equivariant FA;
+    # video.wrist_image is left out of get_rotation_config()'s rotate_image_indices.
+    rotate_video_keys = ["video.image"]
 
     def modality_config(self):
         video_modality = ModalityConfig(
