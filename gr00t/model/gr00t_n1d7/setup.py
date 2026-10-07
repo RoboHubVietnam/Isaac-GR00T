@@ -151,8 +151,16 @@ class Gr00tN1d7Pipeline(ModelPipeline):
     def _create_dataset(self, save_cfg_dir: Path):
         """Create appropriate dataset based on task and mode."""
         if self.config.training.start_from_checkpoint is not None:
+            # Checkpoints may keep processor files under a "processor/" subdirectory.
+            ckpt_dir = Path(self.config.training.start_from_checkpoint)
+            processor_dir = (
+                ckpt_dir / "processor"
+                if (ckpt_dir / "processor").is_dir()
+                and not (ckpt_dir / "processor_config.json").exists()
+                else self.config.training.start_from_checkpoint
+            )
             processor = AutoProcessor.from_pretrained(
-                self.config.training.start_from_checkpoint,
+                processor_dir,
                 # Overrides
                 modality_configs=self.config.data.modality_configs,
                 use_percentiles=self.model_config.use_percentiles,

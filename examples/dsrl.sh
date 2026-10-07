@@ -72,5 +72,9 @@ CMD=(
 if [ "$NUM_GPUS" -gt 1 ]; then
     torchrun --nproc_per_node="$NUM_GPUS" "${CMD[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 else
+    # Pin to one device; otherwise HF Trainer wraps the model in nn.DataParallel on multi-GPU hosts.
+    # Keep only the first visible device (e.g. a Slurm allocation exporting "0,1").
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}"
     python "${CMD[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 fi

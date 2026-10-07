@@ -199,7 +199,12 @@ class LeRobotEpisodeLoader:
         relative_stats_path = meta_dir / LEROBOT_RELATIVE_STATS_FILE_NAME
         if relative_stats_path.exists():
             with open(relative_stats_path, "r") as f:
-                self.stats["relative_action"] = json.load(f)
+                # Skip metadata entries (e.g. "__fingerprints__") that are not joint groups.
+                relative_stats = {
+                    k: v for k, v in json.load(f).items() if not k.startswith("__")
+                }
+            if relative_stats:
+                self.stats["relative_action"] = relative_stats
 
         # Extract key configuration parameters
         self.feature_config = self.info_meta.get("features", {})

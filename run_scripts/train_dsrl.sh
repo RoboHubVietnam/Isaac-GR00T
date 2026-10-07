@@ -1,4 +1,4 @@
-source /home/baoht9/Isaac-GR00T/venv/bin/activate
+source /home/baoht9/Isaac-GR00T/.venv/bin/activate
 export WANDB_API_KEY="938a809d45af5c62586335955d205d25d0db5d04"
 export HF_HOME="/mnt/data/sftp/data/baoht9/"
 export PYTHONWARNINGS="ignore"
@@ -26,6 +26,6 @@ bash examples/dsrl.sh \
     --output-dir "$OUTPUT_DIR-$(date +"%Y-%m-%d_%H-%M-%S")" \
     --max-steps 20000 \
     --global-batch-size 64 \
-    --video_backend torchvision_av \
+    --video_backend torchcodec \
     --use_wandb \
     --wandb_project "GR00TN1.7 RECAP"
