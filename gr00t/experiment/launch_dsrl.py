@@ -98,6 +98,9 @@ class DSRLFinetuneConfig(FinetuneConfig):
     dsrl_c_fail: float = 260.0
     dsrl_reward_scale: float = 1.0
 
+    video_backend: str = "torchcodec"
+    """Video decoder (e.g. torchvision_av for AV1 videos)."""
+
     dsrl_action_dim: int = 0
     """Steered action dims. 0 -> inferred from the dataset's modality.json."""
 
@@ -188,6 +191,7 @@ def run_dsrl(ft_config: DSRLFinetuneConfig):
     logging.info(f"[DSRL] {dsrl_fields}")
 
     config.data.dsrl_n_step = ft_config.dsrl_n_step
+    config.data.video_backend = ft_config.video_backend
 
     config.training.experiment_name = ft_config.experiment_name
     config.training.start_from_checkpoint = ft_config.base_model_path
