@@ -82,6 +82,10 @@ class DataConfig:
     # Validation dataset paths (used when eval_strategy != "no")
     val_dataset_paths: List[str] = field(default_factory=list)
 
+    # DSRL: when > 0, every sample also carries the observation `dsrl_n_step` steps later
+    # (clamped to the last frame), used as s' in the offline TD target.
+    dsrl_n_step: int = 0
+
     # General task / mode config (shared across datasets)
     mode: str = "single_turn"
     random_chop: float = 0.0

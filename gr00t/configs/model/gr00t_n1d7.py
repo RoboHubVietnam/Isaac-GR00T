@@ -121,6 +121,24 @@ class Gr00tN1d7Config(PretrainedConfig):
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 
+    # DSRL-NA parameters (arXiv:2506.15799, Algorithm 1): steer the frozen flow policy by learning
+    # the distribution of its initial noise.
+    use_dsrl: bool = False  # Enable the DSRL heads (Q^A, Q^W, pi^W); frozen policy, noise actor at inference
+    dsrl_hidden_dim: int = 512
+    dsrl_discount: float = 0.99  # per action-chunk decision
+    dsrl_tau: float = 0.005  # EMA rate of the Q^A target network
+    dsrl_noise_bound: float = 1.5  # b_W: actor outputs live in [-b, b]
+    dsrl_target_entropy: float = 0.0
+    dsrl_init_alpha: float = 0.1
+    dsrl_n_noise_samples: int = 4  # prior noise samples per step for Q^W distillation
+    dsrl_noise_mode: str = "full"  # "full" or "chunk_repeat"
+    dsrl_active_horizon: int = 0  # steered chunk length (0 -> action_horizon)
+    dsrl_active_dim: int = 0  # steered action dims (0 -> max_action_dim)
+    dsrl_n_step: int = 16  # env steps between decisions: TD transition is (s_t, a_t, R, s_{t+n_step})
+    dsrl_max_episode_length: int = 520  # reward normalisation (RECAP Eq. 5)
+    dsrl_c_fail: float = 260.0
+    dsrl_reward_scale: float = 1.0
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():

@@ -57,6 +57,7 @@ class DatasetFactory:
             video_decode_workers=self.config.data.video_decode_workers,
             num_ffmpeg_threads=self.config.data.num_ffmpeg_threads,
             overlap_episode_io=self.config.data.overlap_episode_io,
+            dsrl_n_step=self.config.data.dsrl_n_step,
         )
 
     def build(

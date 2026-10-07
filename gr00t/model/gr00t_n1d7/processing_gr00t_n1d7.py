@@ -101,8 +101,11 @@ class Gr00tN1d7DataCollator:
 
         for key in keys:
             values = [elem[key] for elem in features if key in elem]
-            if key == "vlm_content":
-                # Handle vlm_content specially - extract text and images
+            if key in ("vlm_content", "next_vlm_content"):
+                # Handle vlm_content specially - extract text and images.
+                # `next_vlm_content` (DSRL: observation N steps later) is tokenised the same way
+                # and its tensors are exposed under a `next_` prefix.
+                prefix = "next_" if key == "next_vlm_content" else ""
                 text_list = []
                 image_inputs = []
                 for v in values:
@@ -119,7 +122,7 @@ class Gr00tN1d7DataCollator:
                     padding=True,
                 )
                 for k, v in vlm_inputs.items():
-                    batch[k] = v
+                    batch[prefix + k] = v
             elif key in (
                 "pixel_values",
                 "image_grid_thw",
@@ -138,6 +141,7 @@ class Gr00tN1d7DataCollator:
 
 class Gr00tN1d7Processor(BaseProcessor):
     data_collator_class = Gr00tN1d7DataCollator
+    clean_observations: bool = False  # True: never augment / drop state (DSRL)
 
     def __init__(
         self,
@@ -539,6 +543,10 @@ class Gr00tN1d7Processor(BaseProcessor):
             normalized_actions = None
             action_mask = None
 
+        # DSRL trains Q-functions on the observation distribution seen at inference time, so it
+        # disables state dropout and image augmentation via `clean_observations`.
+        augment = self.training and not self.clean_observations
+
         # Concatenate states with optional dropout/noise augmentation
         state_keys = self.modality_configs[embodiment_tag.value]["state"].modality_keys
         exclude_state = self.exclude_state or getattr(
@@ -547,7 +555,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         if exclude_state or (
             self.state_dropout_prob > 0
             and random.random() < self.state_dropout_prob
-            and self.training
+            and augment
         ):
             normalized_states = torch.cat(
                 [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
@@ -568,7 +576,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
 
         # Crop and resize images.
-        if self.training:
+        if augment:
             image_transform = self.train_image_transform
         else:
             image_transform = self.eval_image_transform
@@ -598,7 +606,44 @@ class Gr00tN1d7Processor(BaseProcessor):
         if action_mask is not None:
             transformed_inputs["action_mask"] = action_mask
         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+
+        # Pass through reward signals (DSRL / RECAP).
+        # Keys: "reward", "reward.current_frame_idx", "reward.episode_lengths"
+        for key, value in content.metadata.get("reward", {}).items():
+            transformed_inputs[key] = (
+                value if isinstance(value, np.ndarray) else np.asarray(value, dtype=np.float32)
+            )
         return transformed_inputs
+
+    def process_next_step(self, content) -> dict[str, Any]:
+        """Observation-only processing of the step N frames ahead (DSRL TD target s').
+
+        Returns `next_state` (T, max_state_dim) and `next_vlm_content`; the collator tokenises the
+        latter into `next_input_ids`, `next_pixel_values`, ... No augmentation is applied.
+        """
+        tag = content.embodiment.value
+        state_keys = self.modality_configs[tag]["state"].modality_keys
+        norm_state = self.state_action_processor.apply_state(
+            state=content.states, embodiment_tag=tag
+        )
+        states = torch.cat([torch.from_numpy(norm_state[k]) for k in state_keys], dim=-1)
+        states = torch.cat(
+            [states, torch.zeros(states.shape[0], self.max_state_dim - states.shape[1])], dim=-1
+        )
+        language = content.text
+        if self.formalize_language:
+            language = re.sub(r"[^\w\s]", "", language.lower())
+        vlm_inputs = self._get_vlm_inputs(
+            image_keys=self.modality_configs[tag]["video"].modality_keys,
+            images=content.images,
+            masks=content.masks,
+            image_transform=self.eval_image_transform,
+            language=language,
+        )
+        return {
+            "next_state": states.to(torch.get_default_dtype()),
+            "next_vlm_content": vlm_inputs["vlm_content"],
+        }
 
     def _get_vlm_inputs(
         self,

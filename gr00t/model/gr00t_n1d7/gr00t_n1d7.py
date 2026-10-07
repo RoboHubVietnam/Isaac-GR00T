@@ -26,6 +26,7 @@ import tree
 
 from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
 from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransformer
+from gr00t.model.modules.dsrl import DSRLConfig, DSRLHeads, compute_chunk_transition
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
@@ -100,6 +101,13 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
+
+        # DSRL components -- initialised only when use_dsrl=True
+        self._phase = "action_head"
+        self.dsrl: DSRLHeads | None = None
+        if getattr(config, "use_dsrl", False):
+            self._init_dsrl()
+
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -153,6 +161,144 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.vlln.eval()
                 self.vl_self_attention.eval()
 
+    # ------------------------------------------------------------------
+    # DSRL-NA (arXiv:2506.15799, Algorithm 1)
+    # ------------------------------------------------------------------
+
+    def _init_dsrl(self):
+        """Create Q^A, Q^W and the latent-noise actor pi^W on top of the frozen policy."""
+        cfg = self.config
+        dsrl_cfg = DSRLConfig(
+            backbone_dim=cfg.backbone_embedding_dim,
+            state_dim=cfg.max_state_dim * cfg.state_history_length,
+            action_horizon=cfg.action_horizon,
+            action_dim=cfg.max_action_dim,
+            active_horizon=cfg.dsrl_active_horizon,
+            active_dim=cfg.dsrl_active_dim,
+            hidden_dim=cfg.dsrl_hidden_dim,
+            discount=cfg.dsrl_discount,
+            tau=cfg.dsrl_tau,
+            noise_bound=cfg.dsrl_noise_bound,
+            target_entropy=cfg.dsrl_target_entropy,
+            init_alpha=cfg.dsrl_init_alpha,
+            n_noise_samples=cfg.dsrl_n_noise_samples,
+            noise_mode=cfg.dsrl_noise_mode,
+        )
+        self.dsrl = DSRLHeads(dsrl_cfg)
+        logger.info(
+            f"[DSRL] heads ENABLED  noise_dim={dsrl_cfg.noise_dim} "
+            f"(active {dsrl_cfg.h_act}x{dsrl_cfg.d_act} of {dsrl_cfg.action_horizon}x{dsrl_cfg.action_dim}) "
+            f"noise_bound={dsrl_cfg.noise_bound} n_step={cfg.dsrl_n_step}"
+        )
+
+    def set_phase_dsrl(self):
+        """Freeze the whole policy; only the DSRL heads (and log_alpha) train."""
+        assert self.dsrl is not None, "set use_dsrl=True / call _init_dsrl() first"
+        for p in self.parameters():
+            p.requires_grad = False
+        for n, p in self.dsrl.named_parameters():
+            p.requires_grad = not n.startswith("q_a_target.")
+        self._phase = "dsrl"
+        logger.info(
+            f"[DSRL] trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}"
+        )
+
+    def forward_dsrl(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        next_backbone_output: BatchFeature,
+    ) -> dict:
+        """
+        Offline DSRL-NA step. The backbone / DiT are frozen; Q^A is TD-learned on dataset chunks,
+        Q^W is distilled from Q^A through the frozen denoiser, pi^W maximises Q^W.
+
+        Required action_input keys:
+            state, next_state      : (B, state_history_length, max_state_dim)
+            action, action_mask    : (B, action_horizon, action_dim)
+            embodiment_id          : (B,)
+            reward.current (or reward) : (B, 1)  RECAP label, < 0 means the episode failed
+            reward.current_frame_idx, reward.episode_lengths : (B, 1)
+        """
+        self.set_frozen_modules_to_eval_mode()
+        cfg = self.config
+        embodiment_id = action_input.embodiment_id
+        B = embodiment_id.shape[0]
+
+        with torch.no_grad():
+            cur_in = BatchFeature(
+                data={"state": action_input.state.clone(), "embodiment_id": embodiment_id}
+            )
+            nxt_in = BatchFeature(
+                data={"state": action_input["next_state"].clone(), "embodiment_id": embodiment_id}
+            )
+            cur = self._encode_features(backbone_output, cur_in)
+            nxt = self._encode_features(next_backbone_output, nxt_in)
+            ctxs = {False: (cur, backbone_output), True: (nxt, next_backbone_output)}
+
+            def make_obs(feats, bb_out, state_in):
+                return {
+                    "backbone_features": feats.backbone_features.float(),
+                    "attn_mask": bb_out.backbone_attention_mask,
+                    "state": state_in.state.float().reshape(B, 1, -1),  # (B, 1, T*S)
+                }
+
+            obs = make_obs(cur, backbone_output, cur_in)
+            next_obs = make_obs(nxt, next_backbone_output, nxt_in)
+
+            reward, not_done = compute_chunk_transition(
+                reward_label=action_input[
+                    "reward.current" if "reward.current" in action_input else "reward"
+                ].reshape(B, -1)[:, 0],
+                frame_idx=action_input["reward.current_frame_idx"].reshape(B, -1)[:, 0],
+                episode_length=action_input["reward.episode_lengths"].reshape(B, -1)[:, 0],
+                n_step=cfg.dsrl_n_step,
+                max_episode_length=cfg.dsrl_max_episode_length,
+                c_fail=cfg.dsrl_c_fail,
+                reward_scale=cfg.dsrl_reward_scale,
+            )
+
+            def denoise(w_full: torch.Tensor, use_next: bool) -> torch.Tensor:
+                feats, bb_out = ctxs[use_next]
+                out = self.get_action_with_features(
+                    backbone_features=feats.backbone_features,
+                    state_features=feats.state_features,
+                    embodiment_id=embodiment_id,
+                    backbone_output=bb_out,
+                    action_input=BatchFeature(data={}),  # no "action" key -> no RTC inpainting
+                    init_noise=w_full,
+                )
+                return out["action_pred"].float()
+
+        losses = self.dsrl.compute_losses(
+            obs=obs,
+            next_obs=next_obs,
+            action=action_input.action,
+            action_mask=action_input.action_mask,
+            reward=reward,
+            not_done=not_done,
+            denoise=denoise,
+        )
+        return losses
+
+    def _dsrl_initial_noise(
+        self,
+        backbone_features: torch.Tensor,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        deterministic: bool,
+    ) -> torch.Tensor:
+        """Initial flow-matching noise (B, H, D) drawn from pi^W(s)."""
+        B = backbone_features.shape[0]
+        state = action_input.state.float().reshape(B, 1, -1)
+        w, _ = self.dsrl.actor.sample(
+            backbone_features.float(),
+            backbone_output.backbone_attention_mask,
+            state,
+            deterministic=deterministic,
+        )
+        return self.dsrl.to_noise(w)
+
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         sample = (1 - sample) * self.config.noise_s
@@ -165,9 +311,17 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
-    def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+    def forward(
+        self,
+        backbone_output: BatchFeature,
+        action_input: BatchFeature,
+        next_backbone_output: BatchFeature | None = None,
+    ) -> BatchFeature:
         """
         Forward pass through the action head.
+
+        When the DSRL phase is active (set_phase_dsrl) this trains the DSRL heads instead and
+        requires `next_backbone_output`.
 
         Args:
             backbone_output: Output from the backbone model containing:
@@ -183,6 +337,10 @@ class Gr00tN1d7ActionHead(nn.Module):
             BatchFeature containing:
                 - loss: action prediction loss
         """
+        if self._phase == "dsrl":
+            assert next_backbone_output is not None, "DSRL phase needs next_backbone_output"
+            return self.forward_dsrl(backbone_output, action_input, next_backbone_output)
+
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
 
@@ -317,6 +475,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output: BatchFeature,
         action_input: BatchFeature,
         options: dict[str, Any] | None = None,
+        init_noise: torch.Tensor | None = None,
     ) -> BatchFeature:
         """
         Generate actions using the flow matching diffusion process.
@@ -326,17 +485,34 @@ class Gr00tN1d7ActionHead(nn.Module):
             state_features: [B, state_horizon, input_embedding_dim]
             embodiment_id: [B] (embodiment IDs)
             backbone_output: Output from the backbone model
+            init_noise: optional [B, action_horizon, action_dim] initial noise (DSRL). When None
+                it is N(0, I), or drawn from the DSRL noise actor if one is loaded.
         """
         vl_embeds = backbone_features
 
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
-            dtype=vl_embeds.dtype,
-            device=device,
+        use_dsrl_noise = (
+            init_noise is None
+            and self.dsrl is not None
+            and (options is None or options.get("use_dsrl", True))
         )
+        if init_noise is not None:
+            actions = init_noise.to(device=device, dtype=vl_embeds.dtype)
+        elif use_dsrl_noise:
+            actions = self._dsrl_initial_noise(
+                vl_embeds,
+                backbone_output,
+                action_input,
+                deterministic=bool((options or {}).get("dsrl_deterministic", False)),
+            ).to(dtype=vl_embeds.dtype)
+        else:
+            actions = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.action_dim),
+                dtype=vl_embeds.dtype,
+                device=device,
+            )
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
@@ -581,6 +757,18 @@ class Gr00tN1d7(PreTrainedModel):
         """
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+
+        if self.action_head._phase == "dsrl":
+            # Frozen policy: features of s_t and s_{t+N} are constants for the DSRL heads.
+            with torch.no_grad():
+                backbone_outputs = self.backbone(backbone_inputs)
+                next_backbone_inputs = {
+                    k: backbone_inputs[f"next_{k}"]
+                    for k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")
+                }
+                next_backbone_outputs = self.backbone(next_backbone_inputs)
+            return self.action_head(backbone_outputs, action_inputs, next_backbone_outputs)
+
         backbone_outputs = self.backbone(backbone_inputs)
         action_outputs = self.action_head(backbone_outputs, action_inputs)
 

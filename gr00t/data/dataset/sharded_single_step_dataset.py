@@ -45,6 +45,29 @@ def extract_step_data(
         # TODO: support allow_padding=True
         if allow_padding:
             indices_to_load = [max(0, min(idx, len(episode_data) - 1)) for idx in indices_to_load]
+
+        # Reward modality: synthetic keys + optional parquet column (modality.json maps e.g.
+        # "reward" -> original_key "next.reward"). A missing column means all-success (0.0).
+        if modality == "reward":
+            episode_length = len(episode_data)
+            n = len(config.delta_indices)
+            for key in config.modality_keys:
+                if key == "reward.current_frame_idx":
+                    step_data[modality][key] = np.array(
+                        [max(0, min(step_index + d, episode_length - 1)) for d in config.delta_indices],
+                        dtype=np.float32,
+                    )
+                elif key == "reward.episode_lengths":
+                    step_data[modality][key] = np.full(n, episode_length, dtype=np.float32)
+                else:
+                    col = key if key.startswith("reward.") else f"reward.{key}"
+                    if col in episode_data.columns:
+                        modality_data = episode_data[col].iloc[indices_to_load]
+                        step_data[modality][key] = np.asarray(modality_data.tolist(), dtype=np.float32)
+                    else:
+                        step_data[modality][key] = np.zeros(n, dtype=np.float32)
+            continue
+
         for key in config.modality_keys:
             if f"{modality}.{key}" in episode_data.columns:
                 modality_data = episode_data[f"{modality}.{key}"].iloc[indices_to_load]
@@ -82,6 +105,7 @@ def extract_step_data(
     language_data = step_data.get("language", {})
     assert len(language_data) == 1, f"Expected 1 language, got {len(language_data)}"
     text = language_data[list(language_data.keys())[0]][0]
+    reward_data = step_data.get("reward", {})
 
     vla_step_data = VLAStepData(
         images=video_data,
@@ -90,6 +114,7 @@ def extract_step_data(
         actions=action_data,
         text=text,
         embodiment=embodiment_tag,
+        metadata={"reward": reward_data} if reward_data else {},
     )
     return vla_step_data
 
@@ -158,6 +183,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         video_decode_workers: int = 1,
         num_ffmpeg_threads: int = 0,
         overlap_episode_io: bool = False,
+        dsrl_n_step: int = 0,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -173,6 +199,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.video_decode_workers = max(1, video_decode_workers)
         self.num_ffmpeg_threads = num_ffmpeg_threads
         self.overlap_episode_io = overlap_episode_io
+        # DSRL: every datapoint additionally carries the observation `dsrl_n_step` steps ahead.
+        self.dsrl_n_step = dsrl_n_step
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
@@ -186,6 +214,7 @@ class ShardedSingleStepDataset(ShardedDataset):
             video_decode_workers=self.video_decode_workers,
             num_ffmpeg_threads=self.num_ffmpeg_threads,
             overlap_episode_io=self.overlap_episode_io,
+            next_step_offset=self.dsrl_n_step,
         )
 
         # Create balanced shards from episode timesteps
@@ -287,7 +316,28 @@ class ShardedSingleStepDataset(ShardedDataset):
         )
         # Apply processor to convert to model inputs
         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
-        return self.processor(messages)
+        datapoint = self.processor(messages)
+        if self.dsrl_n_step > 0:
+            datapoint.update(self._get_next_observation(episode_data, step_index))
+        return datapoint
+
+    def _get_next_observation(self, episode_data: tuple, step_index: int) -> dict:
+        """Process the observation at min(t + dsrl_n_step, T - 1) as the DSRL transition target.
+
+        The terminal flag is derived downstream from reward.current_frame_idx / episode_lengths,
+        so clamping at the last frame is harmless.
+        """
+        episode_length = len(episode_data[0])
+        next_index = min(step_index + self.dsrl_n_step, episode_length - 1)
+        obs_configs = {
+            m: ModalityConfig(delta_indices=c.delta_indices, modality_keys=c.modality_keys)
+            for m, c in self.modality_configs.items()
+            if m in ("video", "state", "language", "mask")
+        }
+        next_step = extract_step_data(
+            episode_data, next_index, obs_configs, self.embodiment_tag, self.allow_padding
+        )
+        return self.processor.process_next_step(next_step)
 
     def get_shard_length(self, idx: int) -> int:
         """Get the number of timesteps in a specific shard."""

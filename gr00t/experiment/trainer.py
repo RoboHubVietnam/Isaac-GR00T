@@ -394,6 +394,21 @@ class Gr00tTrainer(Trainer):
         # Record last loss for testing purposes.
         self.loss = loss
 
+        # DSRL / auxiliary scalar metrics returned by the model (keys prefixed "dsrl_").
+        if (
+            model.training
+            and self.state.global_step % self.args.logging_steps == 0
+            and self.args.local_rank in (-1, 0)
+            and isinstance(outputs, dict)
+        ):
+            aux = {
+                k: v.float().mean().item()
+                for k, v in outputs.items()
+                if k.startswith("dsrl_") and torch.is_tensor(v)
+            }
+            if aux:
+                self.log(aux)
+
         # --------------------------------------------------------------
         # Accuracy calculation
         # --------------------------------------------------------------

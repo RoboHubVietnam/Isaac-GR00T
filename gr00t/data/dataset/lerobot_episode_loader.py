@@ -57,7 +57,7 @@ LEROBOT_MODALITY_FILENAME = "modality.json"
 LEROBOT_STATS_FILE_NAME = "stats.json"
 LEROBOT_RELATIVE_STATS_FILE_NAME = "relative_stats.json"
 
-ALLOWED_MODALITIES = ["video", "stereo", "state", "action", "language", "mask"]
+ALLOWED_MODALITIES = ["video", "stereo", "state", "action", "language", "mask", "reward"]
 DEFAULT_COLUMN_NAMES = {
     "state": "observation.state",
     "action": "action",
@@ -123,6 +123,7 @@ class LeRobotEpisodeLoader:
         video_decode_workers: int = 1,
         num_ffmpeg_threads: int = 0,
         overlap_episode_io: bool = False,
+        next_step_offset: int = 0,
     ) -> None:
         """
         Initialize LeRobot episode loader with dataset path and modality configurations.
@@ -138,6 +139,8 @@ class LeRobotEpisodeLoader:
         self.video_decode_workers = max(1, video_decode_workers)
         self.num_ffmpeg_threads = num_ffmpeg_threads
         self.overlap_episode_io = overlap_episode_io
+        # DSRL: also decode the frame `next_step_offset` steps after every requested step.
+        self.next_step_offset = next_step_offset
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -404,6 +407,22 @@ class LeRobotEpisodeLoader:
             for joint_group in joint_groups_df.columns:
                 loaded_df[f"{modality_type}.{joint_group}"] = joint_groups_df[joint_group]
 
+        # Load reward columns from parquet when present. The synthetic keys
+        # (reward.current_frame_idx / reward.episode_lengths) are built in extract_step_data.
+        if "reward" in self.modality_configs:
+            reward_meta = self.modality_meta.get("reward", {})
+            for key in self.modality_configs["reward"].modality_keys:
+                if key in ("reward.current_frame_idx", "reward.episode_lengths"):
+                    continue
+                subkey = key[len("reward.") :] if key.startswith("reward.") else key
+                # Default the "reward" signal to the LeRobot v2.1 `next.reward` column.
+                default_key = "next.reward" if subkey == "reward" else subkey
+                original_key = reward_meta.get(subkey, {}).get("original_key", default_key)
+                if original_key in original_df.columns:
+                    loaded_df[f"reward.{subkey}"] = original_df[original_key]
+                elif subkey in original_df.columns:
+                    loaded_df[f"reward.{subkey}"] = original_df[subkey]
+
         return loaded_df
 
     def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
@@ -594,16 +613,23 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
-    def get_all_step_indices(self, modality: str, step_indices: np.ndarray) -> np.ndarray:
+    def get_all_step_indices(
+        self, modality: str, step_indices: np.ndarray, episode_length: int | None = None
+    ) -> np.ndarray:
         if modality not in self.modality_configs:
             return np.sort(step_indices)
         
         modality_config = self.modality_configs[modality]
 
-        all_step_indices = np.concatenate([
+        index_groups = [
             step_indices + delta_index 
             for delta_index in modality_config.delta_indices
-        ])
+        ]
+        if self.next_step_offset > 0 and modality in ("video", "mask"):
+            assert episode_length is not None
+            next_indices = np.minimum(step_indices + self.next_step_offset, episode_length - 1)
+            index_groups += [next_indices + delta_index for delta_index in modality_config.delta_indices]
+        all_step_indices = np.concatenate(index_groups)
         
         all_step_indices = np.unique(all_step_indices)
         
@@ -642,8 +668,10 @@ class LeRobotEpisodeLoader:
             all_step_indices_video = np.arange(nominal_length)
             all_step_indices_mask = np.arange(nominal_length)
         else:
-            all_step_indices_video = self.get_all_step_indices("video", step_indices)
-            all_step_indices_mask = self.get_all_step_indices("mask", step_indices)    
+            all_step_indices_video = self.get_all_step_indices(
+                "video", step_indices, nominal_length
+            )
+            all_step_indices_mask = self.get_all_step_indices("mask", step_indices, nominal_length)
 
         if not self.overlap_episode_io:
             # Load and parse the parquet data
