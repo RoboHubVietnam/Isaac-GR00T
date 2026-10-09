@@ -100,6 +100,10 @@ class Gr00tPolicy(BasePolicy):
         model = AutoModel.from_pretrained(model_dir)
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
+        # DSRL heads are trained and evaluated in float32 (inputs are cast with .float()).
+        dsrl_heads = getattr(getattr(model, "action_head", None), "dsrl", None)
+        if dsrl_heads is not None:
+            dsrl_heads.float()
         self.model = model
 
         # Load the processor for input/output transformation.
